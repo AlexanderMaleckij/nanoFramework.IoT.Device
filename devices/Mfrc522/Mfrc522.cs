@@ -36,6 +36,17 @@ namespace Iot.Device.Mfrc522
         /// </summary>
         public const SpiMode DefaultSpiMode = SpiMode.Mode0;
 
+        /// <inheritdoc/>
+        public override uint MaximumReadSize => 62;     // 64-byte FIFO, 2 byte CRC
+
+        /// <inheritdoc/>
+        public override uint MaximumWriteSize => 62;    // 64-byte FIFO, 2 byte CRC
+
+        /// <summary>
+        /// The set of NFC protocols that are supported by this transceiver.
+        /// </summary>
+        public const NfcProtocol SupportedProtocols = NfcProtocol.Iso14443_3 | NfcProtocol.Mifare;
+
         private readonly int _pinReset;
 #if DEBUG
         private readonly ILogger _logger;
@@ -867,45 +878,47 @@ namespace Iot.Device.Mfrc522
         }
 
         /// <inheritdoc/>
-        public override int Transceive(byte targetNumber, SpanByte dataToSend, SpanByte dataFromCard)
+        public override int Transceive(byte targetNumber, SpanByte dataToSend, SpanByte dataFromCard, NfcProtocol protocol)
         {
             // targetNumber is not used here as only 1 card can be selected at a time so will be ignored
             // The dataToSend buffer contains anyway the unique of the card
-            Status status;
-
-            // Use built in functions for authentication in case of classic Mifare cards
-            if ((dataToSend[0] == (byte)MifareCardCommand.AuthenticationA) || (dataToSend[0] == (byte)MifareCardCommand.AuthenticationB))
+            if (dataToSend.Length > MaximumWriteSize)
             {
-                // UltralightCommand.GetVersion has the same command code as MifareCardCommand.AuthenticationA
-                // GetVersion returns data; AuthenticationA does not
-                if (dataFromCard.Length == 0)
-                {
-                    status = SendAndReceiveData(MfrcCommand.MifareAuthenticate, dataToSend.ToArray(), null);
-                }
-                else
-                {
+                throw new ArgumentException($"dataToSend exceeds maximum transfer size ({dataToSend.Length} > {MaximumWriteSize})");
+            }
+            else if (dataFromCard.Length > MaximumReadSize)
+            {
+                throw new ArgumentException($"dataFromCard exceeds maximum transfer size ({dataFromCard.Length} > {MaximumReadSize})");
+            }
+            
+            switch (protocol)
+            {
+                case NfcProtocol.Mifare:
+                    switch ((MifareCardCommand)dataToSend[0])
+                    {
+                        case MifareCardCommand.AuthenticationA:
+                        case MifareCardCommand.AuthenticationB:
+                            // Use built in functions for authentication
+                            var status = SendAndReceiveData(MfrcCommand.MifareAuthenticate, dataToSend.ToArray(), null);
+                            return status == Status.Ok ? 0 : -1;
+
+                        case MifareCardCommand.Incrementation:
+                        case MifareCardCommand.Decrementation:
+                        case MifareCardCommand.Restore:
+                        case MifareCardCommand.Write16Bytes:
+                            // Perform these functions in two steps
+                            return TwoStepsWrite16IncDecRestore(dataToSend);
+
+                        default:
+                            return SendWithCrc(dataToSend, dataFromCard);
+                    }
+
+                case NfcProtocol.Iso14443_3:
                     return SendWithCrc(dataToSend, dataFromCard);
-                }
-
-                return status == Status.Ok ? 0 : -1;
+                
+                default:
+                    throw new NotSupportedException($"{nameof(NfcProtocol)} {protocol} is not supported");
             }
-            else if ((dataToSend[0] == (byte)MifareCardCommand.Incrementation) || (dataToSend[0] == (byte)MifareCardCommand.Decrementation)
-                || (dataToSend[0] == (byte)MifareCardCommand.Restore) || (dataToSend[0] == (byte)MifareCardCommand.Write16Bytes))
-            {
-                return TwoStepsWrite16IncDecRestore(dataToSend);
-            }
-            else if (Helper.IsDefined((UltralightCommand)dataToSend[0]))
-            {
-                if ((dataToSend[0] == (byte)UltralightCommand.ReadFast) && (dataFromCard.Length > 62))
-                {
-                    throw new ArgumentException($"Maximum number of pages to be able to read with MFRC522 is 7 as internal FIFO is limited to 64 including CRC.");
-                }
-
-                return SendWithCrc(dataToSend, dataFromCard);
-            }
-
-            status = SendAndReceiveData(MfrcCommand.Transceive, dataToSend.ToArray(), dataFromCard);
-            return status == Status.Ok ? dataFromCard.Length : -1;
         }
 
         private int SendWithCrc(SpanByte dataToSend, SpanByte dataFromCard)
@@ -965,7 +978,7 @@ namespace Iot.Device.Mfrc522
             if (status != Status.Ok)
             {
 #if DEBUG
-                _logger.LogWarning($"{nameof(TwoStepsWrite16IncDecRestore)} - Error {(MfrcCommand)dataToSend[0]}");
+                _logger.LogWarning($"{nameof(TwoStepsWrite16IncDecRestore)} - Error {(MifareCardCommand)dataToSend[0]}");
 #endif
                 return -1;
             }
